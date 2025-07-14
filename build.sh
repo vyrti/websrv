@@ -1,0 +1,1 @@
+RUSTFLAGS="-C target-cpu=native -C link-arg=-static" cargo build --release
