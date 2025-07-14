@@ -1,10 +1,9 @@
 use ntex::web::{self, middleware, App, HttpRequest, HttpResponse, HttpServer};
-use ntex::http::body::Body; // Correctly import the Body type
+use ntex::util::Bytes;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::RwLock;
-use bytes::Bytes;
 
 // --- Application State: File Cache ---
 #[derive(Clone)]
@@ -22,10 +21,12 @@ impl FileCache {
     }
 
     pub async fn get_or_load(&self, path: &Path) -> Result<Arc<Bytes>, std::io::Error> {
+        // Check cache first
         if let Some(file_bytes) = self.cache.read().get(path) {
             return Ok(file_bytes.clone());
         }
 
+        // Double-check locking pattern
         let mut cache_writer = self.cache.write();
         if let Some(file_bytes) = cache_writer.get(path) {
             return Ok(file_bytes.clone());
@@ -33,18 +34,26 @@ impl FileCache {
 
         let full_path = self.static_root.join(path);
         log::info!("Cache miss, loading file from disk: {:?}", full_path);
-
-        // This now works because `glommio` is a direct dependency
-        let file_contents = glommio::io::read_all(full_path).await?;
-        let file_bytes = Arc::new(Bytes::from(file_contents));
-
+        
+        // Use glommio file operations correctly
+        let file = glommio::io::OpenOptions::new()
+            .read(true)
+            .dma_open(&full_path)
+            .await?;
+        
+        let file_size = file.file_size().await?;
+        
+        // Fix: read_at expects (pos: u64, size: usize) and returns ReadResult
+        let read_result = file.read_at(0, file_size as usize).await?;
+        let buffer = read_result.to_vec();
+        
+        let file_bytes = Arc::new(Bytes::from(buffer));
         cache_writer.insert(path.to_path_buf(), file_bytes.clone());
         Ok(file_bytes)
     }
 }
 
 // --- Route Handlers ---
-
 async fn health_handler() -> HttpResponse {
     HttpResponse::Ok()
         .content_type("text/plain; charset=utf-8")
@@ -55,17 +64,24 @@ async fn static_file_handler(
     req: HttpRequest,
     cache: web::types::State<FileCache>,
 ) -> Result<HttpResponse, std::io::Error> {
-    let path_str: String = req.match_info().query("filename").parse().unwrap_or_else(|_| "index.html".to_string());
-    let path = if path_str.is_empty() { Path::new("index.html") } else { Path::new(&path_str) };
-
+    let path_str: String = req
+        .match_info()
+        .query("filename")
+        .parse()
+        .unwrap_or_else(|_| "index.html".to_string());
+    
+    let path = if path_str.is_empty() { 
+        Path::new("index.html") 
+    } else { 
+        Path::new(&path_str) 
+    };
 
     match cache.get_or_load(path).await {
         Ok(file_bytes) => {
             let content_type = mime_guess::from_path(path).first_or_octet_stream();
             Ok(HttpResponse::Ok()
                 .content_type(content_type.as_ref())
-                // Use the imported `Body` type directly
-                .body(Body::from(file_bytes.as_ref().clone())))
+                .body(file_bytes.as_ref().clone()))
         }
         Err(e) => {
             log::warn!("Failed to load file '{:?}': {}", path, e);
@@ -75,11 +91,10 @@ async fn static_file_handler(
 }
 
 // --- Main Application Entrypoint ---
-
-// Use the correct main macro from the ntex-glommio crate
-#[ntex_glommio::main]
-async fn main() -> std::io::Result<()> {
+fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
+    
+    // Create static directory and sample file
     std::fs::create_dir_all("./static_root")?;
     std::fs::write(
         "./static_root/index.html",
@@ -88,17 +103,25 @@ async fn main() -> std::io::Result<()> {
 
     let cache = FileCache::new("./static_root");
     let num_cores = num_cpus::get();
+    
     log::info!("Starting server with {num_cores} workers on http://127.0.0.1:8080");
 
-    HttpServer::new(move || {
-        App::new()
-            .state(cache.clone())
-            .wrap(middleware::Logger::default())
-            .route("/health", web::get().to(health_handler))
-            .route("/{filename:.*}", web::get().to(static_file_handler))
-    })
-    .bind(("127.0.0.1", 8080))?
-    .workers(num_cores)
-    .run()
-    .await
+    // Use glommio executor directly
+    glommio::LocalExecutorBuilder::default()
+        .spawn(move || async move {
+            HttpServer::new(move || {
+                App::new()
+                    .state(cache.clone())
+                    .wrap(middleware::Logger::default())
+                    .route("/health", web::get().to(health_handler))
+                    .route("/{filename:.*}", web::get().to(static_file_handler))
+            })
+            .bind(("127.0.0.1", 8080))?
+            .workers(num_cores)
+            .run()
+            .await
+        })
+        .unwrap()
+        .join()
+        .unwrap()
 }
