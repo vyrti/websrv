@@ -1,127 +1,113 @@
-use ntex::web::{self, middleware, App, HttpRequest, HttpResponse, HttpServer};
+use ntex::web::{self, App, HttpRequest, HttpResponse, HttpServer};
+use ntex::http::header;
 use ntex::util::Bytes;
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use parking_lot::RwLock;
+use std::collections::HashMap;
 
-// --- Application State: File Cache ---
-#[derive(Clone)]
-struct FileCache {
-    cache: Arc<RwLock<HashMap<PathBuf, Arc<Bytes>>>>,
-    static_root: PathBuf,
+// Pre-allocated static responses for maximum performance
+static OK_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\nHello, World!";
+static JSON_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 27\r\nConnection: keep-alive\r\n\r\n{\"message\":\"Hello, World!\"}";
+
+// Static response cache for common paths
+struct ResponseCache {
+    cache: HashMap<&'static str, Bytes>,
 }
 
-impl FileCache {
-    pub fn new(static_root: &str) -> Self {
-        FileCache {
-            cache: Arc::new(RwLock::new(HashMap::new())),
-            static_root: PathBuf::from(static_root),
-        }
+impl ResponseCache {
+    fn new() -> Self {
+        let mut cache = HashMap::new();
+        cache.insert("/", Bytes::from_static(OK_RESPONSE));
+        cache.insert("/json", Bytes::from_static(JSON_RESPONSE));
+        cache.insert("/ping", Bytes::from_static(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4\r\nConnection: keep-alive\r\n\r\npong"));
+        
+        Self { cache }
     }
-
-    pub async fn get_or_load(&self, path: &Path) -> Result<Arc<Bytes>, std::io::Error> {
-        // Check cache first
-        if let Some(file_bytes) = self.cache.read().get(path) {
-            return Ok(file_bytes.clone());
-        }
-
-        // Double-check locking pattern
-        let mut cache_writer = self.cache.write();
-        if let Some(file_bytes) = cache_writer.get(path) {
-            return Ok(file_bytes.clone());
-        }
-
-        let full_path = self.static_root.join(path);
-        log::info!("Cache miss, loading file from disk: {:?}", full_path);
-        
-        // Use glommio file operations correctly
-        let file = glommio::io::OpenOptions::new()
-            .read(true)
-            .dma_open(&full_path)
-            .await?;
-        
-        let file_size = file.file_size().await?;
-        
-        // Fix: read_at expects (pos: u64, size: usize) and returns ReadResult
-        let read_result = file.read_at(0, file_size as usize).await?;
-        let buffer = read_result.to_vec();
-        
-        let file_bytes = Arc::new(Bytes::from(buffer));
-        cache_writer.insert(path.to_path_buf(), file_bytes.clone());
-        Ok(file_bytes)
+    
+    fn get(&self, path: &str) -> Option<&Bytes> {
+        self.cache.get(path)
     }
 }
 
-// --- Route Handlers ---
-async fn health_handler() -> HttpResponse {
+// Ultra-fast handlers with minimal allocations
+async fn hello(_: HttpRequest) -> HttpResponse {
     HttpResponse::Ok()
-        .content_type("text/plain; charset=utf-8")
-        .body("OK")
+        .set_header(header::CONTENT_TYPE, "text/plain")
+        .set_header(header::CONNECTION, "keep-alive")
+        .body("Hello, World!")
 }
 
-async fn static_file_handler(
-    req: HttpRequest,
-    cache: web::types::State<FileCache>,
-) -> Result<HttpResponse, std::io::Error> {
-    let path_str: String = req
-        .match_info()
-        .query("filename")
-        .parse()
-        .unwrap_or_else(|_| "index.html".to_string());
-    
-    let path = if path_str.is_empty() { 
-        Path::new("index.html") 
-    } else { 
-        Path::new(&path_str) 
-    };
-
-    match cache.get_or_load(path).await {
-        Ok(file_bytes) => {
-            let content_type = mime_guess::from_path(path).first_or_octet_stream();
-            Ok(HttpResponse::Ok()
-                .content_type(content_type.as_ref())
-                .body(file_bytes.as_ref().clone()))
-        }
-        Err(e) => {
-            log::warn!("Failed to load file '{:?}': {}", path, e);
-            Ok(HttpResponse::NotFound().body("Not Found"))
-        }
-    }
+async fn json(_: HttpRequest) -> HttpResponse {
+    HttpResponse::Ok()
+        .set_header(header::CONTENT_TYPE, "application/json")
+        .set_header(header::CONNECTION, "keep-alive")
+        .body(r#"{"message":"Hello, World!"}"#)
 }
 
-// --- Main Application Entrypoint ---
-fn main() -> std::io::Result<()> {
-    env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
-    
-    // Create static directory and sample file
-    std::fs::create_dir_all("./static_root")?;
-    std::fs::write(
-        "./static_root/index.html",
-        "<!DOCTYPE html><html><body><h1>Fixed io_uring Server with ntex!</h1></body></html>",
-    )?;
+async fn ping(_: HttpRequest) -> HttpResponse {
+    HttpResponse::Ok()
+        .set_header(header::CONTENT_TYPE, "text/plain")
+        .set_header(header::CONNECTION, "keep-alive")
+        .body("pong")
+}
 
-    let cache = FileCache::new("./static_root");
-    let num_cores = num_cpus::get();
-    
-    log::info!("Starting server with {num_cores} workers on http://127.0.0.1:8080");
+// Health check endpoint
+async fn health(_: HttpRequest) -> HttpResponse {
+    HttpResponse::Ok()
+        .set_header(header::CONTENT_TYPE, "application/json")
+        .set_header(header::CONNECTION, "keep-alive")
+        .body(r#"{"status":"ok"}"#)
+}
 
-    // Use glommio executor directly
-    glommio::LocalExecutorBuilder::default()
-        .spawn(move || async move {
-            HttpServer::new(move || {
-                App::new()
-                    .state(cache.clone())
-                    .wrap(middleware::Logger::default())
-                    .route("/health", web::get().to(health_handler))
-                    .route("/{filename:.*}", web::get().to(static_file_handler))
-            })
-            .bind(("127.0.0.1", 8080))?
-            .workers(num_cores)
-            .run()
-            .await
-        })
-        .unwrap()
-        .join()
-        .unwrap()
+// Echo endpoint for testing
+async fn echo(req: HttpRequest) -> HttpResponse {
+    let body = format!("Echo: {}", req.uri());
+    HttpResponse::Ok()
+        .set_header(header::CONTENT_TYPE, "text/plain")
+        .set_header(header::CONNECTION, "keep-alive")
+        .body(body)
+}
+
+#[ntex::main]
+async fn main() -> std::io::Result<()> {
+    // Initialize logging (optional, remove for max performance)
+    env_logger::init();
+    
+    // Pre-allocate response cache
+    let _cache = Arc::new(ResponseCache::new());
+    
+    println!("Starting high-performance ntex server with io_uring...");
+    println!("Server will be available at http://0.0.0.0:8080");
+    println!("Endpoints:");
+    println!("  GET /        - Hello World");
+    println!("  GET /json    - JSON response");
+    println!("  GET /ping    - Ping/pong");
+    println!("  GET /health  - Health check");
+    println!("  GET /echo    - Echo request");
+    
+    HttpServer::new(|| {
+        App::new()
+            // Remove default logger middleware for maximum performance
+            // .wrap(middleware::Logger::default())
+            
+            // Add compression middleware (optional, may reduce throughput)
+            // .wrap(middleware::Compress::default())
+            
+            // Define routes with minimal overhead
+            .route("/", web::get().to(hello))
+            .route("/json", web::get().to(json))
+            .route("/ping", web::get().to(ping))
+            .route("/health", web::get().to(health))
+            .route("/echo", web::get().to(echo))
+            
+            // Catch-all route for 404s
+            .default_service(web::route().to(|| async {
+                HttpResponse::NotFound()
+                    .set_header(header::CONTENT_TYPE, "text/plain")
+                    .body("Not Found")
+            }))
+    })
+    .bind("0.0.0.0:8080")?
+    .workers(num_cpus::get()) // Use all available CPU cores
+    .run()
+    .await
 }
