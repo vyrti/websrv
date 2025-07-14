@@ -1,0 +1,21 @@
+[package]
+name = "websrv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ntex = "2.15"
+ntex-glommio = "0.5.2"
+log = "0.4"
+env_logger = "0.11"
+num_cpus = "1.17"
+bytes = "1.10"
+parking_lot = "0.12"
+mime_guess = "2.0"
+glommio = "0.9.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
